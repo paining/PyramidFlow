@@ -15,6 +15,11 @@ from glob import glob
 import numpy as np
 from PIL import Image
 
+from image_crop import image_crop
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
 def fix_randseed(seed):
     """ 
         Set random seeds for reproducibility 
@@ -95,6 +100,93 @@ class MVTecAD(Dataset):
             augresults = self.aug(image=img, mask=label)
             img, label = augresults['image'], augresults['mask']
         img, label = self.img2tensor(img), self.label2tensor(label) # 缩放可能产生其他值
+        return {'images': img, 'labels': label.round().int()}
+
+    def __len__(self):
+        return len(self.files) # 指示了batch_index
+
+class MVTecAD_DAC(Dataset):
+    """
+        MVTecAD Dataset.
+        x_size is input image size, y_size is output mask size.
+    """
+    def __init__(self, cls_name, mode='test', x_size=1024, y_size=256, datapath='../mvtec_anomaly_detection', logger=None) -> None:
+        super().__init__()
+        assert mode in ['train', 'val', 'test']
+        self.cls_name = cls_name
+        self.mode = mode
+        
+        self.datapath = datapath
+        self.img_mean = [0.485, 0.456, 0.406] 
+        self.img_std = [0.229, 0.224, 0.225]
+        self.logger = logger if logger else logging.getLogger(__name__)
+        
+        # Different data augmentation methods for different classes.
+        texture_classes = ['carpet', 'leather', 'tile', 'wood', 'grid', 'augmentation']
+        # texture_aug = A.Compose([A.HorizontalFlip(p=0.5),A.VerticalFlip(p=0.5),A.RandomRotate90(p=0.5) ])
+        texture_aug = A.Compose([])
+        aug_dict = dict(zip(texture_classes, [texture_aug]*len(texture_classes)))
+        
+        obj_classes = ['bottle', 'cable', 'capsule', 'hazelnut', 'zipper', \
+                'pill', 'toothbrush', 'transistor', 'metal_nut', 'screw']
+        object_aug  = A.Compose([])
+        aug_dict.update(dict(zip(obj_classes, [object_aug]*len(obj_classes))))
+        
+        if mode == 'train':
+            self.files = sorted(glob(osp.join(self.datapath, cls_name, 'train', 'good', '*.bmp')))
+            self.aug = aug_dict[cls_name] # update as training trainsform
+        elif mode == 'val':
+            self.files = sorted(glob(osp.join(self.datapath, cls_name, 'train', 'good', '*.bmp')))
+        elif mode == 'test':
+            self.files = sorted(glob(osp.join(self.datapath, cls_name, 'test', '*', '*.bmp')))
+
+        self.img2tensor = transforms.Compose([transforms.ToPILImage(),
+                                            # transforms.Resize(x_size),
+                                            transforms.ToTensor(),
+                                            transforms.Normalize(self.img_mean, self.img_std)])
+        self.label2tensor = transforms.Compose([transforms.ToPILImage(), 
+                                                # transforms.Resize(y_size),
+                                                transforms.ToTensor()
+                                                ])
+
+    def __getitem__(self, index):
+        # neg_files
+        file_path = self.files[index]
+        img = np.array(Image.open(file_path).convert('RGB')) # RGB顺序
+
+        crop = True
+        if crop:
+            l, r, w = image_crop(img)
+            if l != -1 and r != -1 and w > 1000:
+                cropsize = 32 * (w // 32)
+                offset = (w % 32) // 2
+                l = l + offset
+                self.croprange = (l, l+cropsize)
+                crop_img_np = img[:, l:l+cropsize, :]
+            else:
+                crop = False
+                crop_img_np = img.copy()
+        else:
+            crop_img_np = img.copy()
+
+        img = crop_img_np.copy()
+        label = np.zeros(img.shape[:2], dtype=np.float32)# h,w
+
+        if self.mode == 'test':
+            label_path = file_path.replace('test', 'ground_truth').replace('.bmp', '.png')
+            if osp.exists(label_path):
+                # label = np.array(Image.open(label_path).convert('L'), dtype=np.float32)/255.
+                label = np.array(Image.open(label_path).convert('1'), dtype=np.float32)
+                if crop:
+                    label = label[:, self.croprange[0]:self.croprange[1]]
+            elif "good" not in label_path:
+                self.logger.warn(f"{label_path} is not exist")
+        if self.mode == 'train' : # 如果没有做仿射数据增强
+            augresults = self.aug(image=img, mask=label)
+            img, label = augresults['image'], augresults['mask']
+        img, label = self.img2tensor(img), self.label2tensor(label) # 缩放可能产生其他值
+        label = F.max_pool2d(label, kernel_size=4, stride=4)
+        self.logger.debug(f"{file_path:60s} : Image({', '.join([str(s) for s in img.shape])}), Label({', '.join([str(s) for s in label.shape])})")
         return {'images': img, 'labels': label.round().int()}
 
     def __len__(self):

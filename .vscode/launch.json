@@ -1,0 +1,50 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Current File",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Train",
+            "type": "python",
+            "request": "launch",
+            "program": "train.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args":[
+                "--cls", "augmentation",
+                "--datapath", "/home/work/.data/dac/PN23_DAC_Silver/SI_06-231017",
+                "--volumeNorm", "CVN",
+                "--batchSize", "4",
+                "--gpu", "0",
+                "--saveMemory", "False",
+                "--save_path", ".result/PyramidFlow/ImageCropTest_CVN"
+            ]
+        },
+        {
+            "name": "Test",
+            "type": "python",
+            "request": "launch",
+            "program": "test.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args":[
+                "--cls", "augmentation",
+                "--datapath", "/home/work/.data/dac/PN23_DAC_Silver/SI_06-231017",
+                "--batchSize", "4",
+                "--gpu", "0",
+                "--saveMemory", "False",
+                "--save_path", "saveDir/ImageCropTest/2023-11-20-13.59",
+                "--ckpt", "saveDir/ImageCropTest/2023-11-20-13.59/models/best.pt",
+            ]
+        },
+    ]
+}
