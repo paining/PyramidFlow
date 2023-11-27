@@ -1,33 +1,63 @@
+#-- This file is made for inference in DeepMC
+
+# from model import PyramidFlow_CFA
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import models
-
-import numpy as np
 from scipy import linalg as la
-
 from util import kornia_filter2d
 from autoFlow import SequentialNF, InvertibleModule, SequentialNet
 from resnet import wide_resnet50_2
+from torchvision import models
 
-class SemiInvertible_1x1Conv(nn.Conv2d):
-    """
-        Semi-invertible 1x1Conv is used at the first stage of NF.
-    """
-    def __init__(self, in_channels, out_channels ) -> None:
-        assert out_channels >= in_channels
-        super().__init__(in_channels, out_channels, kernel_size=1, bias=False)
-        nn.init.orthogonal_(self.weight.data) # orth initialization
-    def inverse(self, output):
-        b, c, h, w = output.shape
-        A = self.weight[..., 0,0] # outch, inch
-        B = output.permute([1,0,2,3]).reshape(c, -1) # outch, bhw
-        X = torch.linalg.lstsq(A, B)  # AX=B
-        return X.solution.reshape(-1, b, h, w).permute([1, 0, 2, 3])
-    @property
-    def logdet(self):
-        w = self.weight.squeeze() # out,in
-        return 0.5*torch.logdet(w.T@w)
+import logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+
+
+class Inference_PyramidFlow(torch.nn.Module):
+    def __init__(self, hyperparam_path, ckpt_path, mean_path, patch_size=4):
+        super().__init__()
+        hyperparam = np.load(hyperparam_path, allow_pickle=True)
+        load_param = ["resnetX", "channel", "num_layer", "num_stack", "ksize", "vn_dims"]
+        for k, v in hyperparam.items():
+            if k not in load_param: continue
+            v = v.tolist() if isinstance(v, np.ndarray) else v
+            setattr(self, k, v)
+        self.patch_size = patch_size
+
+        self.model = PyramidFlow_CFA(
+            self.resnetX,
+            self.channel,
+            self.num_layer,
+            self.num_stack,
+            self.ksize,
+            self.vn_dims,
+        )
+        self.model(torch.zeros(1, 3, 416, 2592))
+        self.model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+
+        self.mean = torch.load(mean_path)
+
+    def forward(self, x):
+        pyramid = self.model(x)
+
+        pyramid_diff = [
+            (feat2 - template).abs()
+            for feat2, template in zip(pyramid, self.mean)
+        ]
+        diff = self.model.pyramid.compose_pyramid(pyramid_diff).mean(
+            1, keepdim=True
+        )  # b,1,h,w
+        B, _, H, W = diff.shape
+        # b p*p (h/p)*(w/p)
+        diff = F.unfold(diff, kernel_size=self.patch_size, stride=self.patch_size)
+        diff = diff.kthvalue(self.k, dim=1, keepdim=True) # b 1 (h/p)*(w/p)
+        diff = diff.reshape(B, 1, H//self.patch_size, W//self.patch_size)
+        return diff
+
 
 class SemiInvertible_3x3Conv(nn.Conv2d):
     """
@@ -303,64 +333,6 @@ class FlowBlock2(InvertibleModule):
         inputs = outputs[:self.start_idx]+(x0, x1, x2)+outputs[self.start_idx+3:]
         in_logdets = logdets[:self.start_idx]+(logdet0, logdet1-dlogdet1, logdet2)+logdets[self.start_idx+3:]
         return inputs, in_logdets
-
-
-class PyramidFlow(nn.Module):
-    """
-        PyramidFlow
-        NOTE: resnetX=0 use 1x1 conv with #channel channel.
-    """
-    def __init__(self, resnetX, channel, num_level, num_stack, ksize, vn_dims, savemem=False):
-        super().__init__()
-        assert num_level >= 2
-        assert resnetX in [18, 34, 0]
-        self.channel = channel if resnetX==0 else 64
-        self.num_level = num_level
-        
-        modules = []
-        for _ in range(num_stack):
-            for range_start in [0, 1]:
-                if range_start == 1:
-                    modules.append(FlowBlock(self.channel, direct='up', start_level=0, ksize=ksize, vn_dims=vn_dims))
-                for start_idx in range(range_start, num_level, 2):
-                    if start_idx+2 < num_level:
-                        modules.append(FlowBlock2(self.channel, start_level=start_idx, ksize=ksize, vn_dims=vn_dims))
-                    elif start_idx+1 < num_level:
-                        modules.append(FlowBlock(self.channel, direct='down', start_level=start_idx, ksize=ksize, vn_dims=vn_dims))
-        self.nf = SequentialNF(modules) if savemem else SequentialNet(modules)
-
-        if resnetX != 0:
-            resnet = models.resnet18(pretrained=True, ) if resnetX==18 else models.resnet34(pretrained=True, )
-            self.inconv = nn.Sequential(
-                resnet.conv1,
-                resnet.bn1,
-                resnet.relu,
-                resnet.maxpool,
-                resnet.layer1
-            )# 1024->256
-        else:
-            self.inconv = SemiInvertible_1x1Conv(3, self.channel)
-
-        self.pyramid = LaplacianMaxPyramid(num_level)
-
-    def forward(self, imgs):
-        b, c, h, w = imgs.shape
-        assert h%(2**(self.num_level-1))==0 and w%(2**(self.num_level-1))==0
-        with torch.no_grad():
-            feat1 = self.inconv(imgs) # fix inconv/encoder
-        pyramid = self.pyramid.build_pyramid(feat1)
-        logdets = tuple(torch.zeros_like(pyramid_j) for pyramid_j in pyramid)
-        pyramid_out, logdets_out = self.nf.forward(pyramid, logdets)
-        return pyramid_out
-
-    def inverse(self, pyramid_out):
-        logdets_out = tuple(torch.zeros_like(pyramid_j) for pyramid_j in pyramid_out)
-        pyramid_in, logdets_in = self.nf.inverse(pyramid_out, logdets_out)
-        feat1 = self.pyramid.compose_pyramid(pyramid_in)
-        if self.channel != 64:
-            input = self.inconv.inverse(feat1)
-            return input
-        return feat1
 
 class PyramidFlow_CFA(nn.Module):
     """

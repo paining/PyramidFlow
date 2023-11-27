@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as TF
 from torch.utils.data import DataLoader
 
 import numpy as np
 import time, argparse
 from sklearn.metrics import roc_auc_score
 
-from model import PyramidFlow
+from model import PyramidFlow, PyramidFlow_CFA
 from util import MVTecAD_DAC as MVTecAD, BatchDiffLoss
 from util import fix_randseed, compute_pro_score_fast, getLogger
 
@@ -15,6 +16,7 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 import matplotlib.pyplot as plt
 import os.path as osp
 import os
+from torchinfo import summary
 
 
 def train(
@@ -46,13 +48,22 @@ def train(
         "batch_size": batch_size,
     }
     loader_dict = fix_randseed(seed=0)
-    os.makedirs(osp.join(save_path, save_name), exist_ok=True)
-    os.makedirs(osp.join(save_path, save_name, "models"), exist_ok=True)
+    os.makedirs(osp.join(save_path), exist_ok=True)
+    os.makedirs(osp.join(save_path, "models"), exist_ok=True)
 
     # model
-    flow = PyramidFlow(
+    flow = PyramidFlow_CFA(
         resnetX, channel, num_layer, num_stack, ksize, vn_dims, saveMem
     ).to(device)
+    logger.info(
+        summary(
+            flow,
+            (1, 3, 416, 2592),
+            col_names=['input_size', 'output_size', 'kernel_size'],
+            depth=4,
+            verbose=0,
+        )
+    )
     # x_size = 256 if resnetX==0 else 1024
     x_size = (416, 4096)
     y_size = (104, 1024)
@@ -185,11 +196,12 @@ def train(
             )
             ax.set_title("Losses")
             ax.set_xlabel("Epochs")
+            ax.set_xticks(np.arange(epoch+1), minor=True)
             ax.grid(True, "both", "both", alpha=0.2)
             ax.legend()
             ax.set_yscale("log")
             fig.tight_layout()
-            fig.savefig(osp.join(save_path, save_name, "loss.png"))
+            fig.savefig(osp.join(save_path, "loss.png"))
             plt.close(fig)
 
             # test
@@ -197,6 +209,7 @@ def train(
             diff_list, labels_list = [], []
             for test_dict in tqdm(test_loader, desc="Test", leave=False):
                 image, labels = test_dict["images"].to(device), test_dict["labels"]
+                if resnetX != 0: labels = get_patch_y(labels)
                 with torch.no_grad():
                     pyramid2 = flow(image)
                     pyramid_diff = [
@@ -258,9 +271,10 @@ def train(
             ax.set_title("Performance")
             ax.set_xlabel("Epoch")
             ax.legend()
+            ax.set_xticks(np.arange(epoch+1), minor=True)
             ax.grid(True, "both", "both", alpha=0.2)
             fig.tight_layout()
-            fig.savefig(osp.join(save_path, save_name, "AUROC.png"))
+            fig.savefig(osp.join(save_path, "AUROC.png"))
             plt.close(fig)
 
             # Draw AUROC Graph
@@ -276,6 +290,7 @@ def train(
             )
             ax.set_title("Losses")
             ax.set_xlabel("Epochs")
+            ax.set_xticks(np.arange(epoch+1), minor=True)
             ax.grid(True, "both", "both", alpha=0.2)
             ax.legend()
             ax.set_yscale("log")
@@ -300,16 +315,17 @@ def train(
             ax2.set_title("Performance")
             ax2.set_xlabel("Epoch")
             ax2.legend()
+            ax2.set_xticks(np.arange(epoch+1), minor=True)
             ax2.grid(True, "both", "both", alpha=0.2)
             fig.tight_layout()
-            fig.savefig(osp.join(save_path, save_name, "both.png"))
+            fig.savefig(osp.join(save_path, "both.png"))
             plt.close(fig)
 
-            torch.save(flow.state_dict(), osp.join(save_path, save_name, "models", f"{epoch}.pt"))
-            torch.save(flow.state_dict(), osp.join(save_path, save_name, "models", f"latest.pt"))
+            torch.save(flow.state_dict(), osp.join(save_path, "models", f"{epoch}.pt"))
+            torch.save(flow.state_dict(), osp.join(save_path, "models", f"latest.pt"))
             if min_val_loss > val_losses_lst[-1]:
                 min_val_loss = val_losses_lst[-1]
-                torch.save(flow.state_dict(), osp.join(save_path, save_name, "models", f"best.pt"))
+                torch.save(flow.state_dict(), osp.join(save_path, "models", f"best.pt"))
                 logger.info(f"Best Model saved in {epoch}")
 
             del amaps, labels_all, diff_list, labels_list
@@ -317,8 +333,18 @@ def train(
     save_dict["image_auroc_lst"] = image_auroc_lst
     save_dict["pixel_pro_lst"] = pixel_pro_lst
     save_dict["losses_lst"] = losses_lst
-    np.savez(f"saveDir/{save_name}.npz", **save_dict)  # save all
+    save_dict["losses_lst"] = val_losses_lst
+    np.savez(f"{save_path}/{save_name}.npz", **save_dict)  # save all
 
+def get_patch_y(y, patch_size=4, strong_patch=1):
+    B, C, H, W = y.shape
+    if C != 1:
+        y = y.mean(dim=1, keepdim=True)
+    if patch_size == 1:
+        return y
+    ys = TF.unfold(y.float(), kernel_size=patch_size, stride=patch_size).sum(dim=1) >= strong_patch
+    ys = ys.reshape(B, 1, H//patch_size, W//patch_size)
+    return ys
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Training on MVTecAD")
@@ -351,7 +377,7 @@ if __name__ == "__main__":
         "--encoder",
         type=str,
         default="resnet18",
-        choices=["none", "resnet18", "resnet34"],
+        choices=["none", "resnet18", "resnet34", "resnet_cfa"],
     )
     parser.add_argument(
         "--numLayer", type=str, default="auto", choices=["auto", "2", "4", "8"]
@@ -372,7 +398,14 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     cls_name = args.cls
-    resnetX = 0 if args.encoder == "none" else int(args.encoder[6:])
+    try:
+        resnetX = 0 if args.encoder == "none" else int(args.encoder[6:])
+    except ValueError as e:
+        if args.encoder[6:] == "_cfa":
+            resnetX = "_cfa"
+        else:
+            raise ValueError("Wrong Encoder parameter!\n" + str(e))
+
     if args.volumeNorm == "auto":
         vn_dims = (
             (0, 2, 3)

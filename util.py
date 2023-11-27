@@ -185,9 +185,14 @@ class MVTecAD_DAC(Dataset):
             augresults = self.aug(image=img, mask=label)
             img, label = augresults['image'], augresults['mask']
         img, label = self.img2tensor(img), self.label2tensor(label) # 缩放可能产生其他值
-        label = F.max_pool2d(label, kernel_size=4, stride=4)
+        # label = F.max_pool2d(label, kernel_size=4, stride=4)
         self.logger.debug(f"{file_path:60s} : Image({', '.join([str(s) for s in img.shape])}), Label({', '.join([str(s) for s in label.shape])})")
-        return {'images': img, 'labels': label.round().int()}
+        return {
+            'images': img,
+            'labels': label.round().int(),
+            'filename': file_path,
+            'imgtype': osp.basename(osp.dirname(file_path))
+        }
 
     def __len__(self):
         return len(self.files) # 指示了batch_index

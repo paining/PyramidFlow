@@ -50,11 +50,6 @@ def test(
         "num_stack": num_stack,
         "batch_size": batch_size,
     }
-    dict_path = [
-        osp.join(save_path, file)
-        for file in os.listdir(save_path)
-        if file.endswith(".npz")
-    ]
     loader_dict = fix_randseed(seed=0)
     save_path = osp.join(save_path, "result", osp.splitext(osp.basename(ckpt))[0])
     os.makedirs(save_path, exist_ok=True)
@@ -115,60 +110,66 @@ def test(
     val_losses_lst = [0]
     t0 = time.time()
 
-    # # val for template
-    # flow.eval()
-    # feat_sum, cnt = [0 for _ in range(num_layer)], 0
-    # for val_dict in tqdm(val_loader, desc="Calculate MEAN", leave=True):
-    #     image = val_dict["images"].to(device)
-    #     with torch.no_grad():
-    #         pyramid2 = flow(image)
-    #         cnt += 1
-    #     feat_sum = [p0 + p for p0, p in zip(feat_sum, pyramid2)]
-    # feat_mean = [p / cnt for p in feat_sum]
-    # torch.save(feat_mean, osp.join(save_path, "pyramidflow_mean.pt"))
+    # val for template
+    flow.eval()
+    feat_sum, cnt = [0 for _ in range(num_layer)], 0
+    for val_dict in tqdm(val_loader, desc="Calculate MEAN", leave=True):
+        image = val_dict["images"].to(device)
+        with torch.no_grad():
+            pyramid2 = flow(image)
+            cnt += 1
+        feat_sum = [p0 + p for p0, p in zip(feat_sum, pyramid2)]
+    feat_mean = [p / cnt for p in feat_sum]
 
-    # # test
-    # flow.eval()
-    # diff_list, labels_list = [], []
-    # for test_dict in tqdm(test_loader, desc="Test", leave=True):
-    #     image, labels = test_dict["images"].to(device), test_dict["labels"]
-    #     if resnetX != 0: labels = get_patch_y(labels)
-    #     with torch.no_grad():
-    #         pyramid2 = flow(image)
-    #         pyramid_diff = [
-    #             (feat2 - template).abs()
-    #             for feat2, template in zip(pyramid2, feat_mean)
-    #         ]
-    #         diff = flow.pyramid.compose_pyramid(pyramid_diff).mean(
-    #             1, keepdim=True
-    #         )  # b,1,h,w
-    #         diff_list.append(diff.cpu())
-    #         labels_list.append(labels.cpu() == 1)  # b,1,h,w
-
-    from pyramidflow import Inference_PyramidFlow as PF
-    model = PF(dict_path[0], ckpt, osp.join(save_path, "pyramidflow_mean.pt"))
-    model.to(device)
-    model.eval()
+    targets = {
+        'P1' : ['SI-06-G01-06', 'SI-06-G02-18', ],
+        'P2' : ['SI-06-G14-03', ],
+        'P3' : ['SI-06-G02-16', 'SI-06-G04-18', 'SI-06-G06-13', 'SI-06-G06-24', 'SI-06-G06-31', 'SI-06-G13-12', 'SI-06-G13-13', 'SI-06-G14-02', 'SI-06-G18-30', ],
+    }
+    filelist = []
+    log_str = ('Targets : LeftBranch\n' +
+               f"\n".join([f"{k:4s} : {v}" for k, v in targets.items()]))
+    logger.info(log_str)
+    # test
+    flow.eval()
     diff_list, labels_list = [], []
+    gi_np_masks, bi_np_masks, ap_masks = [], [], []
     for test_dict in tqdm(test_loader, desc="Test", leave=True):
         image, labels = test_dict["images"].to(device), test_dict["labels"]
+        filename, imgtype = test_dict["filename"][0], test_dict['imgtype'][0]
+        if imgtype != 'good' and osp.splitext(osp.basename(filename))[0] not in targets[imgtype]:
+            continue
+        # tqdm.write(f"{imgtype:5s} : {osp.splitext(osp.basename(filename))[0]}")
+        filelist.append(filename)
         if resnetX != 0: labels = get_patch_y(labels)
         with torch.no_grad():
-            # pyramid2 = flow(image)
-            # pyramid_diff = [
-            #     (feat2 - template).abs()
-            #     for feat2, template in zip(pyramid2, feat_mean)
-            # ]
-            # diff = flow.pyramid.compose_pyramid(pyramid_diff).mean(
-            #     1, keepdim=True
-            # )  # b,1,h,w
-            diff = model(image)
+            pyramid2 = flow(image)
+            pyramid_diff = [
+                (feat2 - template).abs()
+                for feat2, template in zip(pyramid2, feat_mean)
+            ]
+            diff = flow.pyramid.compose_pyramid(pyramid_diff).mean(
+                1, keepdim=True
+            )  # b,1,h,w
             diff_list.append(diff.cpu())
             labels_list.append(labels.cpu() == 1)  # b,1,h,w
+            if imgtype == "good":
+                gi_np_masks.append(torch.ones_like(labels, dtype=torch.bool).flatten())
+                bi_np_masks.append(torch.zeros_like(labels, dtype=torch.bool).flatten())
+                ap_masks.append(torch.zeros_like(labels, dtype=torch.bool).flatten())
+            else:
+                gi_np_masks.append(torch.zeros_like(labels, dtype=torch.bool).flatten())
+                kwargs = {'kernel_size': 17, 'padding': 8, 'stride': 1} if resnetX==0 else {'kernel_size': 5, 'padding': 2, 'stride': 1}
+                erodes = TF.max_pool2d(labels.float(), **kwargs)
+                bi_np_masks.append(erodes.cpu().flatten() != 1)
+                ap_masks.append(labels.cpu().flatten() == 1)
 
     labels_all = torch.concat(labels_list, dim=0)  # b1hw
     amaps = torch.concat(diff_list, dim=0)  # b1hw
     amaps, labels_all = amaps[:, 0], labels_all[:, 0]  # both b,h,w
+    gi_np_masks = torch.concat(gi_np_masks)
+    bi_np_masks = torch.concat(bi_np_masks)
+    ap_masks = torch.concat(ap_masks)
     pixel_auroc = roc_auc_score(
         labels_all.flatten(), amaps.flatten()
     )  # pixel score
@@ -205,7 +206,7 @@ def test(
     ax.set_xlim(-0.05, 1.05)
     ax.set_ylim(-0.05, 1.05)
     fig.tight_layout()
-    fig.savefig(osp.join(save_path, "ROC.png"))
+    fig.savefig(osp.join(save_path, "Target-ROC.png"))
     plt.close(fig)
 
     ###### Find ITPR 100%, IFPR 0% Threshold and Performance
@@ -213,31 +214,39 @@ def test(
     itpr1_thr = i_thresholds[idx].item()
     p_idx = torch.max(torch.where(thresholds >= itpr1_thr)[0])
     logger.info(f"ITPR 100% Threshold = {itpr1_thr}")
-    logger.info(f"ITNR = {1-i_fpr[idx]:6f}, IFPR = {i_fpr[idx]:6f}")
-    logger.info(f"IFNR = {1-i_tpr[idx]:6f}, ITPR = {i_tpr[idx]:6f}")
-    logger.info(f"PTNR = {1-fpr[p_idx]:6f}, PFPR = {fpr[p_idx]:6f}")
-    logger.info(f"PFNR = {1-tpr[p_idx]:6f}, PTPR = {tpr[p_idx]:6f}")
+    logger.info(f"ITPR = {i_tpr[idx]:6f}, IFPR = {i_fpr[idx]:6f}")
+    logger.info(f"PTPR = {tpr[p_idx]:6f}, PFPR = {fpr[p_idx]:6f}")
 
     idx = torch.max(torch.where(i_fpr == 0)[0])
     ifpr0_thr = i_thresholds[idx].item()
     p_idx = torch.max(torch.where(thresholds >= ifpr0_thr)[0])
     logger.info(f"IFPR   0% Threshold = {ifpr0_thr}")
-    logger.info(f"ITNR = {1-i_fpr[idx]:6f}, IFPR = {i_fpr[idx]:6f}")
-    logger.info(f"IFNR = {1-i_tpr[idx]:6f}, ITPR = {i_tpr[idx]:6f}")
-    logger.info(f"PTNR = {1-fpr[p_idx]:6f}, PFPR = {fpr[p_idx]:6f}")
-    logger.info(f"PFNR = {1-tpr[p_idx]:6f}, PTPR = {tpr[p_idx]:6f}")
+    logger.info(f"ITPR = {i_tpr[idx]:6f}, IFPR = {i_fpr[idx]:6f}")
+    logger.info(f"PTPR = {tpr[p_idx]:6f}, PFPR = {fpr[p_idx]:6f}")
 
 
+    amap_f = amaps.flatten()
+    leftbranch_threshold = amap_f[gi_np_masks].max().item()
+    idx = torch.max(torch.where(i_thresholds >= leftbranch_threshold)[0])
+    p_idx = torch.max(torch.where(thresholds >= leftbranch_threshold)[0])
+    logger.info(f"IFPR   0% Threshold = {leftbranch_threshold}")
+    logger.info(f"ITPR = {i_tpr[idx]:6f}, IFPR = {i_fpr[idx]:6f}")
+    logger.info(f"PTPR = {tpr[p_idx]:6f}, PFPR = {fpr[p_idx]:6f}")
+    
     fig, ax = plt.subplots(figsize=(10, 8))
     ax.hist(
-        amaps[labels_all==0].cpu().detach().numpy(),
-        bins=100, range=(vmin, vmax), histtype="step", label="Normal"
+        amap_f[gi_np_masks].cpu().detach().numpy(),
+        bins=100, range=(vmin, vmax), histtype="step", label="GI_NP", color="g"
     )
     ax.hist(
-        amaps[labels_all==1].cpu().detach().numpy(), bins=100,
-        range=(vmin, vmax), histtype="step", label="Defect"
+        amap_f[bi_np_masks].cpu().detach().numpy(),
+        bins=100, range=(vmin, vmax), histtype="step", label="BI_NP", color="b"
     )
-    ax.axvline(i_threshold, color="r", linestyle=":")
+    ax.hist(
+        amap_f[ap_masks].cpu().detach().numpy(), bins=100,
+        range=(vmin, vmax), histtype="step", label="AP", color="r"
+    )
+    ax.axvline(leftbranch_threshold, color="r", linestyle=":", label="max(GI_NP)")
     ax.axvline(itpr1_thr, color="b", linestyle=":", label="ITPR 100%")
     ax.axvline(ifpr0_thr, color="g", linestyle=":", label="IFPR 0%")
     ax.set_xlabel("Anomaly Scores")
@@ -247,16 +256,16 @@ def test(
     ax.legend()
     ax.grid(True, "both", "both", alpha=0.2)
     fig.tight_layout()
-    fig.savefig(osp.join(save_path, "distribution.png"))
+    fig.savefig(osp.join(save_path, "Target-distribution.png"))
     plt.close(fig)
 
     for i, amap in enumerate(diff_list):
-        file_path = test_dataset.files[i]
+        file_path = filelist[i]
         filename = osp.splitext(osp.basename(file_path))[0]
         typename = osp.basename(osp.dirname(file_path))
         amap_np = amap.squeeze().cpu().detach().numpy()
-        if resnetX != 0: amap_np = cv2.resize(amap_np, (amap_np.shape[-1]*4, amap_np.shape[-2]*4))
-        boundary = (amap_np >= i_threshold).astype(np.uint8)
+        if resnetX != 0: amap_np = cv2.resize(amap_np, (amap_np.shape[-1]*4, amap_np.shape[-2]*4), interpolation=cv2.INTER_LINEAR)
+        boundary = (amap_np > leftbranch_threshold).astype(np.uint8)
         boundary = cv2.morphologyEx(
             boundary,
             cv2.MORPH_DILATE,
@@ -268,6 +277,19 @@ def test(
         os.makedirs(osp.join(save_path, typename), exist_ok=True)
         savefile = osp.join(save_path, typename, f"{filename}.png")
         cv2.imwrite(savefile, heatmap)
+        max_score = amap.max().item()
+        if typename == "good":
+            if max_score > leftbranch_threshold:
+                result_str = "FP"
+            else:
+                result_str = "TN"
+        else:
+            if max_score > leftbranch_threshold:
+                result_str = "TP"
+            else:
+                result_str = "FN"
+
+        logger.info(f"{typename:10s},{filename:40s},{max_score:10f},{result_str}")
 
     if pixel_auroc > np.max(pixel_auroc_lst):
         save_dict["state_dict_pixel"] = {
@@ -352,7 +374,6 @@ if __name__ == "__main__":
             resnetX = "_cfa"
         else:
             raise ValueError("Wrong Encoder parameter!\n" + str(e))
-
     if args.volumeNorm == "auto":
         vn_dims = (
             (0, 2, 3)
