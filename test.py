@@ -38,6 +38,8 @@ def test(
     num_epochs,
     save_path,
     ckpt,
+    patch_size,
+    top_k,
 ):
     # save config
     save_dict = {
@@ -115,17 +117,17 @@ def test(
     val_losses_lst = [0]
     t0 = time.time()
 
-    # # val for template
-    # flow.eval()
-    # feat_sum, cnt = [0 for _ in range(num_layer)], 0
-    # for val_dict in tqdm(val_loader, desc="Calculate MEAN", leave=True):
-    #     image = val_dict["images"].to(device)
-    #     with torch.no_grad():
-    #         pyramid2 = flow(image)
-    #         cnt += 1
-    #     feat_sum = [p0 + p for p0, p in zip(feat_sum, pyramid2)]
-    # feat_mean = [p / cnt for p in feat_sum]
-    # torch.save(feat_mean, osp.join(save_path, "pyramidflow_mean.pt"))
+    # val for template
+    flow.eval()
+    feat_sum, cnt = [0 for _ in range(num_layer)], 0
+    for val_dict in tqdm(val_loader, desc="Calculate MEAN", leave=True):
+        image = val_dict["images"].to(device)
+        with torch.no_grad():
+            pyramid2 = flow(image)
+            cnt += 1
+        feat_sum = [p0 + p for p0, p in zip(feat_sum, pyramid2)]
+    feat_mean = [p / cnt for p in feat_sum]
+    torch.save(feat_mean, osp.join(save_path, "pyramidflow_mean.pt"))
 
     # # test
     # flow.eval()
@@ -146,13 +148,15 @@ def test(
     #         labels_list.append(labels.cpu() == 1)  # b,1,h,w
 
     from pyramidflow import Inference_PyramidFlow as PF
-    model = PF(dict_path[0], ckpt, osp.join(save_path, "pyramidflow_mean.pt"))
+    model = PF(dict_path[0], ckpt, osp.join(save_path, "pyramidflow_mean.pt"), patch_size, top_k)
+    label_patch_size = 4*patch_size if resnetX != 0 else patch_size
     model.to(device)
     model.eval()
     diff_list, labels_list = [], []
     for test_dict in tqdm(test_loader, desc="Test", leave=True):
         image, labels = test_dict["images"].to(device), test_dict["labels"]
-        if resnetX != 0: labels = get_patch_y(labels)
+        # if resnetX != 0: labels = get_patch_y(labels)
+        labels = get_patch_y(labels, label_patch_size)
         with torch.no_grad():
             # pyramid2 = flow(image)
             # pyramid_diff = [
@@ -339,6 +343,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--batchSize", type=int, default=2)
+    parser.add_argument("--patchsize", type=int, default=1)
+    parser.add_argument("--top_k", type=int, default=1)
     parser.add_argument("--saveMemory", type=bool, default=True)
     parser.add_argument("--save_path", type=str, default="./saveDir")
     parser.add_argument("--ckpt", type=str)
@@ -396,6 +402,8 @@ if __name__ == "__main__":
     logger.info(f"> Batch Size: {batchSize}")
     logger.info(f"> GPU device: cuda:{gpu_id}")
     logger.info(f"> Save Training Memory: {saveMem}")
+    logger.info(f"> Patch Size: {args.patchsize}")
+    logger.info(f"> Top K in Patch: {args.top_k}")
     logger.info(f"============================")
 
     test(
@@ -414,5 +422,7 @@ if __name__ == "__main__":
         save_memory=saveMem,
         num_epochs=num_epochs,
         save_path=args.save_path,
-        ckpt = args.ckpt
+        ckpt = args.ckpt,
+        patch_size = args.patchsize,
+        top_k=args.top_k
     )

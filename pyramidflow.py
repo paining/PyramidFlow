@@ -1,12 +1,10 @@
 #-- This file is made for inference in DeepMC
 
-# from model import PyramidFlow_CFA
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy import linalg as la
-from util import kornia_filter2d
 from autoFlow import SequentialNF, InvertibleModule, SequentialNet
 from resnet import wide_resnet50_2
 from torchvision import models
@@ -15,18 +13,21 @@ import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+torch.use_deterministic_algorithms(True, warn_only=True)
+
 
 
 class Inference_PyramidFlow(torch.nn.Module):
-    def __init__(self, hyperparam_path, ckpt_path, mean_path, patch_size=4):
+    def __init__(self, hyperparam_path, ckpt_path, mean_path, patch_size=4, k=1):
         super().__init__()
         hyperparam = np.load(hyperparam_path, allow_pickle=True)
         load_param = ["resnetX", "channel", "num_layer", "num_stack", "ksize", "vn_dims"]
-        for k, v in hyperparam.items():
-            if k not in load_param: continue
-            v = v.tolist() if isinstance(v, np.ndarray) else v
-            setattr(self, k, v)
+        for key, value in hyperparam.items():
+            if key not in load_param: continue
+            value = value.tolist() if isinstance(value, np.ndarray) else value
+            setattr(self, key, value)
         self.patch_size = patch_size
+        self.k = k
 
         self.model = PyramidFlow_CFA(
             self.resnetX,
@@ -45,7 +46,7 @@ class Inference_PyramidFlow(torch.nn.Module):
         pyramid = self.model(x)
 
         pyramid_diff = [
-            (feat2 - template).abs()
+            (feat2 - F.interpolate(template, feat2.shape[-2:], mode="bilinear")).abs()
             for feat2, template in zip(pyramid, self.mean)
         ]
         diff = self.model.pyramid.compose_pyramid(pyramid_diff).mean(
@@ -54,10 +55,27 @@ class Inference_PyramidFlow(torch.nn.Module):
         B, _, H, W = diff.shape
         # b p*p (h/p)*(w/p)
         diff = F.unfold(diff, kernel_size=self.patch_size, stride=self.patch_size)
-        diff = diff.kthvalue(self.k, dim=1, keepdim=True) # b 1 (h/p)*(w/p)
+        diff, _ = diff.topk(self.k, dim=1) # b 1 (h/p)*(w/p)
+        diff = diff[:, -1, :]
         diff = diff.reshape(B, 1, H//self.patch_size, W//self.patch_size)
         return diff
 
+
+def kornia_filter2d(input, kernel):
+    """
+        conv2d function from kornia.
+    """
+    # prepare kernel
+    b, c, h, w = input.shape
+    tmp_kernel: torch.Tensor = kernel.unsqueeze(1).to(input)
+    tmp_kernel = tmp_kernel.expand(-1, c, -1, -1)
+    height, width = tmp_kernel.shape[-2:]
+    # kernel and input tensor reshape to align element-wise or batch-wise params
+    tmp_kernel = tmp_kernel.reshape(-1, 1, height, width)
+    input = input.view(-1, tmp_kernel.size(0), input.size(-2), input.size(-1))
+    # convolve the tensor with the kernel.
+    output = F.conv2d(input, tmp_kernel, groups=tmp_kernel.size(0), padding=0, stride=1)
+    return output
 
 class SemiInvertible_3x3Conv(nn.Conv2d):
     """
